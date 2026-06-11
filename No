@@ -1,0 +1,796 @@
+--[[
+    Pokemon Brick Bronze | Roria Conquest — Executor Script
+    Features:
+      • Rayfield UI with themed window
+      • Remote & event hooking (all remotes via debug spy)
+      • Encounter tracker reads FROM debug spy data
+      • Encounter history log
+      • Debug console tab with live remote spy + copy & show/hide logs
+      • Toggle hooks on/off
+    
+    Requires a LuaU executor with loadstring, hookfunction/hookmetamethod,
+    getgenv, game:HttpGet, and RemoteEvent/RemoteFunction access.
+--]]
+
+---------------------------------------------------------------------------
+-- Services
+---------------------------------------------------------------------------
+local Players          = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local HttpService      = game:GetService("HttpService")
+
+local LocalPlayer = Players.LocalPlayer
+
+---------------------------------------------------------------------------
+-- Secure Mode (optional — uncomment if the game detects you)
+---------------------------------------------------------------------------
+-- getgenv().SecureMode = true
+
+---------------------------------------------------------------------------
+-- Load Rayfield
+---------------------------------------------------------------------------
+local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
+
+---------------------------------------------------------------------------
+-- Window
+---------------------------------------------------------------------------
+local Window = Rayfield:CreateWindow({
+    Name                  = "🎮 PBB Roria Conquest Hub",
+    Icon                  = "swords",                     -- Lucide icon
+    LoadingTitle          = "Pokemon Brick Bronze",
+    LoadingSubtitle       = "Roria Conquest — Loading...",
+    ShowText              = "PBB Hub",
+    Theme                 = "Default",
+    ToggleUIKeybind       = "K",
+
+    DisableRayfieldPrompts = false,
+    DisableBuildWarnings   = false,
+
+    ConfigurationSaving = {
+        Enabled    = true,
+        FolderName = "PBB_RoriaConquest",
+        FileName   = "PBBConfig"
+    },
+
+    Discord = {
+        Enabled       = false,
+        Invite        = "noinvitelink",
+        RememberJoins = true
+    },
+
+    KeySystem   = false,
+    KeySettings = {
+        Title          = "PBB Hub",
+        Subtitle       = "Key System",
+        Note           = "No key required",
+        FileName       = "PBBKey",
+        SaveKey        = true,
+        GrabKeyFromSite = false,
+        Key            = {"free"}
+    }
+})
+
+---------------------------------------------------------------------------
+-- State
+---------------------------------------------------------------------------
+local encounterEnabled   = false   -- master toggle for encounter tracker
+local debugEnabled       = false   -- master toggle for debug remote spy
+local showDebugLogs      = true    -- toggle to show/hide log text in debug tab
+local encounterLog       = {}      -- history of encountered Pokemon
+local debugLog           = {}      -- captured remote calls (raw strings)
+local debugLogRaw        = {}      -- captured raw args per remote call (for encounter parsing)
+local MAX_LOG_ENTRIES    = 50      -- cap so we don't eat memory
+
+local activeHooks        = {}      -- store connections so we can disconnect
+local debugConnections   = {}      -- debug hook connections
+
+local totalEncounters    = 0
+local totalShinies       = 0
+
+---------------------------------------------------------------------------
+-- Tabs
+---------------------------------------------------------------------------
+local EncounterTab = Window:CreateTab("⚔️ Encounters",  "swords")
+local HistoryTab   = Window:CreateTab("📜 History",     "scroll-text")
+local DebugTab     = Window:CreateTab("🐛 Debug",       "bug")
+local SettingsTab  = Window:CreateTab("⚙️ Settings",    "settings")
+
+---------------------------------------------------------------------------
+--                 HELPER: Parse Battle Data
+---------------------------------------------------------------------------
+--[[
+    ACTUAL GAME PROTOCOL (from debug logs):
+    
+    The game uses ONE hashed RemoteEvent (e.g. "7d2686b7dee4...").
+    The event TYPE is in arg[1] as a string: "BattleEvent", "HidePlayers", etc.
+    
+    BattleEvent structure:
+      arg[1] = "BattleEvent"
+      arg[2] = battle session ID (e.g. "YM;o3#G\"<6MC*tGBlV+d")
+      arg[3] = sub-command: "update", "request", "inactiveside"
+      arg[4+] = data
+    
+    The "update" sub-command (arg[3] == "update") sends a TABLE of
+    pipe-delimited Showdown-like protocol strings in arg[4].
+    
+    Opponent Pokemon are p2 entries:
+      |cache|1p2: Woobat|Woobat, L24, M|71/71|[icon]605|[ball]1|[owned]
+      |switch|1p2a: Woobat|Woobat, L24, M|71/71
+    
+    Format of the details segment: "Name, LLevel, Gender" or "Name, LLevel, Gender, shiny"
+    Shiny is indicated by ", shiny" at the end of the details string.
+--]]
+
+local lastBattleSessionId = nil  -- Track to avoid duplicate encounters per battle
+
+-- Parse a single pipe-segment for p2 (opponent) Pokemon data
+-- Returns { Name, Level, Gender, HP, MaxHP, IsShiny } or nil
+local function parseP2Entry(segment)
+    -- Match cache or switch entries for p2
+    -- Examples:
+    --   |cache|1p2: Woobat|Woobat, L24, M|71/71|[icon]605|[ball]1|[owned]
+    --   |switch|1p2a: Woobat|Woobat, L24, M|71/71
+    
+    -- Split the segment by "|"
+    local parts = {}
+    for part in segment:gmatch("[^|]+") do
+        table.insert(parts, part)
+    end
+    
+    -- Look for a part that indicates p2 (opponent side)
+    local isP2 = false
+    local detailsPart = nil
+    local hpPart = nil
+    
+    for i, part in ipairs(parts) do
+        -- Check for p2 identifier like "1p2: Woobat" or "1p2a: Woobat"
+        if part:match("%dp2[a-z]*:%s*") then
+            isP2 = true
+            -- The next part should be the details: "Woobat, L24, M"
+            if parts[i + 1] then
+                detailsPart = parts[i + 1]
+            end
+            -- The part after that is HP: "71/71"
+            if parts[i + 2] then
+                hpPart = parts[i + 2]
+            end
+            break
+        end
+    end
+    
+    if not isP2 or not detailsPart then
+        return nil
+    end
+    
+    -- Parse details: "Woobat, L24, M" or "Woobat, L24, M, shiny"
+    local name, level, gender, extra = detailsPart:match("^(.+), L(%d+), (%a+)(.*)")
+    if not name then
+        -- Try without gender
+        name, level = detailsPart:match("^(.+), L(%d+)")
+    end
+    
+    if not name then return nil end
+    
+    -- Trim whitespace
+    name = name:match("^%s*(.-)%s*$")
+    
+    -- Check for shiny
+    local isShiny = false
+    if extra and extra:lower():find("shiny") then
+        isShiny = true
+    end
+    
+    -- Parse HP: "71/71" or "71/71;0.5" (with status modifier)
+    local currentHP, maxHP = "?", "?"
+    if hpPart then
+        local hp1, hp2 = hpPart:match("^(%d+)/(%d+)")
+        if hp1 then
+            currentHP = hp1
+            maxHP = hp2
+        end
+    end
+    
+    return {
+        Name     = name,
+        Level    = level or "?",
+        HP       = currentHP .. "/" .. maxHP,
+        IsShiny  = isShiny,
+        Shiny    = isShiny and "✨ YES — SHINY!" or "No"
+    }
+end
+
+-- Parse the full update data (table of pipe-delimited strings) for p2 entries
+local function parseUpdateForOpponent(updateData)
+    if type(updateData) ~= "table" then
+        -- Could be a single string
+        if type(updateData) == "string" then
+            updateData = {updateData}
+        else
+            return nil
+        end
+    end
+    
+    for _, line in ipairs(updateData) do
+        if type(line) == "string" then
+            -- Check if this line has p2 data (opponent)
+            if line:find("p2") then
+                -- Try to parse cache or switch entries
+                -- Split by the protocol separator pattern
+                -- Each entry starts with |command|
+                
+                -- Find cache entries for p2
+                local cachePattern = "|cache|%d+p2[a-z]*:%s*"
+                local switchPattern = "|switch|%d+p2[a-z]*:%s*"
+                
+                if line:find("cache") and line:find("p2") then
+                    -- Extract the p2 cache segment
+                    -- The format has multiple | separated sections
+                    local result = parseP2Entry(line)
+                    if result then
+                        return result
+                    end
+                end
+                
+                if line:find("switch") and line:find("p2") then
+                    local result = parseP2Entry(line)
+                    if result then
+                        return result
+                    end
+                end
+            end
+        end
+    end
+    
+    return nil
+end
+
+---------------------------------------------------------------------------
+--                        ENCOUNTER TAB
+---------------------------------------------------------------------------
+
+-- Live info paragraphs (updated each battle)
+local EncounterStatus = EncounterTab:CreateParagraph({
+    Title   = "Encounter Status",
+    Content = "Enable the tracker in Settings, then the debug spy\nwill feed battle data here automatically."
+})
+
+EncounterTab:CreateDivider()
+
+local PokemonName = EncounterTab:CreateParagraph({
+    Title   = "Pokemon Name",
+    Content = "—"
+})
+
+local PokemonLevel = EncounterTab:CreateParagraph({
+    Title   = "Level",
+    Content = "—"
+})
+
+local PokemonHP = EncounterTab:CreateParagraph({
+    Title   = "Health",
+    Content = "—"
+})
+
+local PokemonShiny = EncounterTab:CreateParagraph({
+    Title   = "✨ Shiny?",
+    Content = "—"
+})
+
+EncounterTab:CreateDivider()
+
+local TotalEncounters = EncounterTab:CreateLabel("Total Encounters: 0", "hash", Color3.fromRGB(255, 255, 255), false)
+local ShinyCount      = EncounterTab:CreateLabel("Shinies Found: 0", "sparkles", Color3.fromRGB(255, 215, 0), false)
+
+---------------------------------------------------------------------------
+-- ENCOUNTER: called from the debug spy when any remote fires
+---------------------------------------------------------------------------
+local function processEncounter(remoteName, rawArgs)
+    if not encounterEnabled then return end
+    
+    -- The event type is in arg[1], NOT the remote name (remote is a hash)
+    local eventType = rawArgs[1]
+    if type(eventType) ~= "string" then return end
+    if eventType ~= "BattleEvent" then return end
+    
+    -- arg[2] = battle session ID
+    -- arg[3] = sub-command: "update", "request", "inactiveside"
+    local battleId   = rawArgs[2]
+    local subCommand = rawArgs[3]
+    
+    -- We only care about "update" commands — they contain the initial battle state
+    -- with cache entries showing the opponent's Pokemon
+    if type(subCommand) ~= "string" or subCommand ~= "update" then return end
+    
+    -- arg[4] = table of pipe-delimited Showdown protocol strings
+    local updateData = rawArgs[4]
+    
+    -- Avoid duplicate encounters for the same battle session
+    if battleId == lastBattleSessionId then return end
+    
+    -- Try to parse opponent (p2) from the update data
+    local data = parseUpdateForOpponent(updateData)
+    if not data then
+        EncounterStatus:Set({
+            Title   = "Encounter Status",
+            Content = "🟡 BattleEvent update received but couldn't find opponent (p2) data.\nCheck Debug tab for raw args."
+        })
+        print("[PBB Hub] BattleEvent update received but no p2 data found")
+        return
+    end
+    
+    -- Mark this session as processed
+    lastBattleSessionId = battleId
+    
+    totalEncounters += 1
+    if data.IsShiny then
+        totalShinies += 1
+    end
+
+    -- Update live UI
+    EncounterStatus:Set({ Title = "Encounter Status", Content = "🟢 BATTLE DETECTED!" })
+    PokemonName:Set({ Title = "Pokemon Name", Content = data.Name })
+    PokemonLevel:Set({ Title = "Level", Content = "Lv. " .. data.Level })
+    PokemonHP:Set({ Title = "Health", Content = data.HP })
+    PokemonShiny:Set({ Title = "✨ Shiny?", Content = data.Shiny })
+
+    TotalEncounters:Set("Total Encounters: " .. totalEncounters, "hash", Color3.fromRGB(255, 255, 255), false)
+    ShinyCount:Set("Shinies Found: " .. totalShinies, "sparkles", Color3.fromRGB(255, 215, 0), false)
+
+    -- Add to encounter history
+    local timestamp = os.date("%H:%M:%S")
+    local entry = string.format("[%s] %s | Lv.%s | HP: %s | Shiny: %s",
+        timestamp, data.Name, data.Level, data.HP, data.Shiny)
+
+    table.insert(encounterLog, 1, entry)
+    if #encounterLog > MAX_LOG_ENTRIES then
+        table.remove(encounterLog)
+    end
+
+    HistoryParagraph:Set({
+        Title   = "Encounter History (" .. #encounterLog .. ")",
+        Content = table.concat(encounterLog, "\n")
+    })
+
+    -- Shiny notification
+    if data.IsShiny then
+        Rayfield:Notify({
+            Title    = "✨ SHINY FOUND! ✨",
+            Content  = data.Name .. " (Lv." .. data.Level .. ") is SHINY!",
+            Duration = 10,
+            Image    = "sparkles"
+        })
+    else
+        Rayfield:Notify({
+            Title    = "Wild Pokemon!",
+            Content  = data.Name .. " (Lv." .. data.Level .. ")",
+            Duration = 4,
+            Image    = "swords"
+        })
+    end
+
+    -- Console log
+    print(string.format("[PBB Hub] Encounter #%d: %s | Lv.%s | HP: %s | Shiny: %s",
+        totalEncounters, data.Name, data.Level, data.HP, data.Shiny))
+end
+
+---------------------------------------------------------------------------
+--                        HISTORY TAB
+---------------------------------------------------------------------------
+
+HistoryParagraph = HistoryTab:CreateParagraph({
+    Title   = "Encounter History",
+    Content = "No encounters yet."
+})
+
+HistoryTab:CreateButton({
+    Name     = "🗑️  Clear History",
+    Callback = function()
+        encounterLog = {}
+        HistoryParagraph:Set({
+            Title   = "Encounter History",
+            Content = "No encounters yet."
+        })
+        Rayfield:Notify({
+            Title    = "History Cleared",
+            Content  = "Encounter log has been wiped.",
+            Duration = 3,
+            Image    = "trash-2"
+        })
+    end
+})
+
+---------------------------------------------------------------------------
+--                        DEBUG TAB
+---------------------------------------------------------------------------
+
+local DebugParagraph = DebugTab:CreateParagraph({
+    Title   = "Remote Spy Log",
+    Content = "Enable Debug mode in Settings to start capturing remotes."
+})
+
+DebugTab:CreateDivider()
+
+-- Toggle to show/hide the log text in the UI
+DebugTab:CreateToggle({
+    Name         = "👁️  Show Logs in UI",
+    CurrentValue = true,
+    Flag         = "ShowDebugLogs",
+    Callback     = function(value)
+        showDebugLogs = value
+        if value then
+            -- Re-show current log
+            if #debugLog > 0 then
+                DebugParagraph:Set({
+                    Title   = "Remote Spy Log (" .. #debugLog .. " entries)",
+                    Content = table.concat(debugLog, "\n")
+                })
+            else
+                DebugParagraph:Set({
+                    Title   = "Remote Spy Log",
+                    Content = "No logs captured yet."
+                })
+            end
+        else
+            DebugParagraph:Set({
+                Title   = "Remote Spy Log (HIDDEN)",
+                Content = "Logs are still being captured in the background.\nToggle 'Show Logs in UI' to see them."
+            })
+        end
+    end
+})
+
+DebugTab:CreateDivider()
+
+-- Copy logs to clipboard
+DebugTab:CreateButton({
+    Name     = "📋  Copy Logs to Clipboard",
+    Callback = function()
+        if #debugLog == 0 then
+            Rayfield:Notify({
+                Title    = "No Logs",
+                Content  = "There are no debug logs to copy.",
+                Duration = 3,
+                Image    = "clipboard-x"
+            })
+            return
+        end
+
+        local logText = "=== PBB Debug Log (" .. #debugLog .. " entries) ===\n"
+        logText = logText .. table.concat(debugLog, "\n")
+        logText = logText .. "\n=== END ==="
+
+        -- setclipboard is the standard executor function for clipboard
+        if setclipboard then
+            setclipboard(logText)
+            Rayfield:Notify({
+                Title    = "Copied!",
+                Content  = #debugLog .. " log entries copied to clipboard.",
+                Duration = 3,
+                Image    = "clipboard-check"
+            })
+        elseif toclipboard then
+            toclipboard(logText)
+            Rayfield:Notify({
+                Title    = "Copied!",
+                Content  = #debugLog .. " log entries copied to clipboard.",
+                Duration = 3,
+                Image    = "clipboard-check"
+            })
+        else
+            -- Fallback: print to console
+            print(logText)
+            Rayfield:Notify({
+                Title    = "Clipboard Not Supported",
+                Content  = "Logs printed to console instead (F9).",
+                Duration = 4,
+                Image    = "terminal"
+            })
+        end
+    end
+})
+
+DebugTab:CreateButton({
+    Name     = "🗑️  Clear Debug Log",
+    Callback = function()
+        debugLog = {}
+        debugLogRaw = {}
+        if showDebugLogs then
+            DebugParagraph:Set({
+                Title   = "Remote Spy Log",
+                Content = "Log cleared."
+            })
+        end
+        Rayfield:Notify({
+            Title    = "Cleared",
+            Content  = "Debug log wiped.",
+            Duration = 2,
+            Image    = "trash-2"
+        })
+    end
+})
+
+DebugTab:CreateDivider()
+
+DebugTab:CreateButton({
+    Name     = "🖨️  Print All Remotes to Console",
+    Callback = function()
+        print("\n========== REMOTE EVENTS ==========")
+        local reCount, rfCount = 0, 0
+        for _, v in ipairs(ReplicatedStorage:GetDescendants()) do
+            if v:IsA("RemoteEvent") then
+                print("[RemoteEvent]  " .. v:GetFullName())
+                reCount += 1
+            elseif v:IsA("RemoteFunction") then
+                print("[RemoteFunction]  " .. v:GetFullName())
+                rfCount += 1
+            end
+        end
+        print("====================================")
+        print(string.format("Total: %d RemoteEvents, %d RemoteFunctions\n", reCount, rfCount))
+        Rayfield:Notify({
+            Title    = "Remotes Printed",
+            Content  = reCount .. " events, " .. rfCount .. " functions. Check console (F9).",
+            Duration = 4,
+            Image    = "terminal"
+        })
+    end
+})
+
+---------------------------------------------------------------------------
+--                        SETTINGS TAB
+---------------------------------------------------------------------------
+
+-- Encounter toggle
+SettingsTab:CreateToggle({
+    Name         = "⚔️  Enable Encounter Tracker",
+    CurrentValue = false,
+    Flag         = "EncounterToggle",
+    Callback     = function(value)
+        encounterEnabled = value
+        if value then
+            -- Make sure debug spy is also running (encounter reads from it)
+            if not debugEnabled then
+                Rayfield:Notify({
+                    Title    = "Tip",
+                    Content  = "Debug Spy is OFF. Enable it too so encounters can be detected!",
+                    Duration = 5,
+                    Image    = "alert-triangle"
+                })
+            end
+            EncounterStatus:Set({ Title = "Encounter Status", Content = "🟢 Tracker ACTIVE — waiting for battle data from debug spy..." })
+            Rayfield:Notify({
+                Title    = "Encounter Tracker",
+                Content  = "Now parsing battle remotes for opponent data.",
+                Duration = 4,
+                Image    = "swords"
+            })
+        else
+            EncounterStatus:Set({ Title = "Encounter Status", Content = "🔴 Tracker DISABLED" })
+            Rayfield:Notify({
+                Title    = "Encounter Tracker",
+                Content  = "Stopped parsing encounters.",
+                Duration = 3,
+                Image    = "octagon"
+            })
+        end
+    end
+})
+
+-- Debug toggle
+SettingsTab:CreateToggle({
+    Name         = "🐛  Enable Debug Remote Spy",
+    CurrentValue = false,
+    Flag         = "DebugToggle",
+    Callback     = function(value)
+        debugEnabled = value
+        if value then
+            startDebugHook()
+            Rayfield:Notify({
+                Title    = "Debug Mode",
+                Content  = "Remote spy is now active. All remote traffic is being captured.",
+                Duration = 3,
+                Image    = "bug"
+            })
+        else
+            stopDebugHook()
+            Rayfield:Notify({
+                Title    = "Debug Mode",
+                Content  = "Remote spy disabled.",
+                Duration = 3,
+                Image    = "bug-off"
+            })
+        end
+    end
+})
+
+SettingsTab:CreateDivider()
+
+SettingsTab:CreateParagraph({
+    Title   = "ℹ️  How to use",
+    Content = "1. Enable Debug Remote Spy in Settings (captures all remotes)\n2. Enable Encounter Tracker in Settings\n3. Start a wild battle in-game\n4. The spy detects battle remotes and feeds data to Encounters tab\n5. History tab keeps a log of past encounters\n6. Use Debug tab to see raw remote traffic, copy logs, or hide them"
+})
+
+---------------------------------------------------------------------------
+--             DEBUG HOOK (All Remotes) — also feeds encounters
+---------------------------------------------------------------------------
+
+function startDebugHook()
+    -- Connect to ALL RemoteEvents in ReplicatedStorage
+    for _, desc in ipairs(ReplicatedStorage:GetDescendants()) do
+        if desc:IsA("RemoteEvent") then
+            local conn = desc.OnClientEvent:Connect(function(...)
+                if not debugEnabled then return end
+
+                local args = {...}
+
+                -- Build the log string
+                local argStr = ""
+                for i, arg in ipairs(args) do
+                    local s = tostring(arg)
+                    if type(arg) == "table" then
+                        local ok, json = pcall(function()
+                            return HttpService:JSONEncode(arg)
+                        end)
+                        if ok then
+                            s = json
+                        else
+                            s = "{table}"
+                        end
+                    end
+                    argStr = argStr .. "[" .. i .. "] " .. s
+                    if i < #args then argStr = argStr .. " | " end
+                end
+
+                local timestamp = os.date("%H:%M:%S")
+                local logEntry = string.format("[%s] %s → %s", timestamp, desc.Name, argStr)
+
+                -- Store the log
+                table.insert(debugLog, 1, logEntry)
+                if #debugLog > MAX_LOG_ENTRIES then
+                    table.remove(debugLog)
+                end
+
+                -- Store raw args for encounter parsing
+                table.insert(debugLogRaw, 1, { remoteName = desc.Name, args = args, time = timestamp })
+                if #debugLogRaw > MAX_LOG_ENTRIES then
+                    table.remove(debugLogRaw)
+                end
+
+                -- Update debug UI (only if showing logs)
+                if showDebugLogs then
+                    DebugParagraph:Set({
+                        Title   = "Remote Spy Log (" .. #debugLog .. " entries)",
+                        Content = table.concat(debugLog, "\n")
+                    })
+                end
+
+                print("[PBB Debug] " .. logEntry)
+
+                -- >>> FEED TO ENCOUNTER TRACKER <<<
+                -- This is the bridge: debug spy captures the remote, then
+                -- passes it to the encounter system for parsing
+                processEncounter(desc.Name, args)
+            end)
+
+            table.insert(debugConnections, conn)
+        end
+    end
+
+    -- Also watch for new remotes added later
+    local addedConn = ReplicatedStorage.DescendantAdded:Connect(function(desc)
+        if desc:IsA("RemoteEvent") and debugEnabled then
+            local conn = desc.OnClientEvent:Connect(function(...)
+                if not debugEnabled then return end
+                local args = {...}
+
+                local timestamp = os.date("%H:%M:%S")
+
+                -- Build arg string
+                local argStr = ""
+                for i, arg in ipairs(args) do
+                    local s = tostring(arg)
+                    if type(arg) == "table" then
+                        local ok, json = pcall(function()
+                            return HttpService:JSONEncode(arg)
+                        end)
+                        if ok then s = json else s = "{table}" end
+                    end
+                    argStr = argStr .. "[" .. i .. "] " .. s
+                    if i < #args then argStr = argStr .. " | " end
+                end
+
+                local logEntry = string.format("[%s] [NEW] %s → %s", timestamp, desc.Name, argStr)
+                table.insert(debugLog, 1, logEntry)
+                if #debugLog > MAX_LOG_ENTRIES then
+                    table.remove(debugLog)
+                end
+
+                table.insert(debugLogRaw, 1, { remoteName = desc.Name, args = args, time = timestamp })
+                if #debugLogRaw > MAX_LOG_ENTRIES then
+                    table.remove(debugLogRaw)
+                end
+
+                if showDebugLogs then
+                    DebugParagraph:Set({
+                        Title   = "Remote Spy Log (" .. #debugLog .. " entries)",
+                        Content = table.concat(debugLog, "\n")
+                    })
+                end
+
+                -- Feed to encounter tracker
+                processEncounter(desc.Name, args)
+            end)
+            table.insert(debugConnections, conn)
+        end
+    end)
+    table.insert(debugConnections, addedConn)
+
+    -- Hook __namecall if available (catches outgoing FireServer calls too)
+    if hookmetamethod then
+        local oldNamecall
+        oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+            local method = getnamecallmethod()
+            if debugEnabled and method == "FireServer" and self:IsA("RemoteEvent") then
+                local selfName = self.Name
+                local args = {...}
+                local timestamp = os.date("%H:%M:%S")
+
+                local argStr = ""
+                for i, arg in ipairs(args) do
+                    local s = tostring(arg)
+                    if type(arg) == "table" then
+                        local ok, json = pcall(function()
+                            return HttpService:JSONEncode(arg)
+                        end)
+                        if ok then s = json else s = "{table}" end
+                    end
+                    argStr = argStr .. "[" .. i .. "] " .. s
+                    if i < #args then argStr = argStr .. " | " end
+                end
+
+                local logEntry = string.format("[%s] [OUT] %s → %s", timestamp, selfName, argStr)
+                table.insert(debugLog, 1, logEntry)
+                if #debugLog > MAX_LOG_ENTRIES then
+                    table.remove(debugLog)
+                end
+
+                if showDebugLogs then
+                    DebugParagraph:Set({
+                        Title   = "Remote Spy Log (" .. #debugLog .. " entries)",
+                        Content = table.concat(debugLog, "\n")
+                    })
+                end
+
+                print("[PBB Debug][OUT] " .. logEntry)
+            end
+            return oldNamecall(self, ...)
+        end)
+        print("[PBB Hub] Hooked __namecall metamethod")
+    end
+
+    print("[PBB Hub] Debug remote spy started — watching " .. #debugConnections .. " remotes")
+end
+
+function stopDebugHook()
+    for _, conn in ipairs(debugConnections) do
+        if conn and conn.Disconnect then
+            conn:Disconnect()
+        end
+    end
+    debugConnections = {}
+    print("[PBB Hub] Debug hooks disconnected")
+end
+
+---------------------------------------------------------------------------
+-- Startup notification
+---------------------------------------------------------------------------
+Rayfield:Notify({
+    Title    = "PBB Roria Conquest Hub",
+    Content  = "Script loaded!\n1. Enable Debug Spy in Settings\n2. Enable Encounter Tracker\n3. Start a battle!\nPress K to show/hide menu.",
+    Duration = 8,
+    Image    = "gamepad-2"
+})
+
+print("[PBB Hub] Script loaded successfully — v0.02")
+print("[PBB Hub] Game: Pokemon Brick Bronze | Roria Conquest")
+print("[PBB Hub] Player: " .. (LocalPlayer and LocalPlayer.Name or "Unknown"))
