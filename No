@@ -73,25 +73,56 @@ local Window = Rayfield:CreateWindow({
 ---------------------------------------------------------------------------
 -- State
 ---------------------------------------------------------------------------
-local encounterEnabled   = false   -- master toggle for encounter tracker
-local debugEnabled       = false   -- master toggle for debug remote spy
-local showDebugLogs      = true    -- toggle to show/hide log text in debug tab
-local encounterLog       = {}      -- history of encountered Pokemon
-local debugLog           = {}      -- captured remote calls (raw strings)
-local debugLogRaw        = {}      -- captured raw args per remote call (for encounter parsing)
-local MAX_LOG_ENTRIES    = 50      -- cap so we don't eat memory
+local encounterEnabled   = false
+local debugEnabled       = false
+local showDebugLogs      = true
+local encounterLog       = {}
+local debugLog           = {}
+local debugLogRaw        = {}
+local MAX_LOG_ENTRIES    = 50
 
-local activeHooks        = {}      -- store connections so we can disconnect
-local debugConnections   = {}      -- debug hook connections
+local activeHooks        = {}
+local debugConnections   = {}
 
 local totalEncounters    = 0
 local totalShinies       = 0
+
+-- v0.03: Battle state
+local inBattle           = false
+local currentBattleId    = nil
+local currentOpponentName = nil
+local currentOpponentMaxHP = nil
+local currentRqId        = nil
+local currentPlayerSide  = nil
+local gameRemote         = nil   -- reference to the hashed remote for FireServer
+
+-- v0.03: Auto-search
+local autoSearchEnabled  = false
+local searchDistance     = 20
+
+-- v0.03: Webhook
+local webhookUrl         = ""
+local webhookOnShiny     = true
+local webhookOnAll       = false
+
+-- v0.03: Auto-catch/flee
+local autoFleeEnabled    = false
+local autoCatchShiny     = false
+local autoCatchByName    = false
+local autoCatchByLevel   = false
+local targetNames        = {}   -- list of pokemon names to auto-catch
+local targetMinLevel     = 1
+local targetMaxLevel     = 100
+local fleeCommand        = "run"
+local catchCommand       = "ball 1"
 
 ---------------------------------------------------------------------------
 -- Tabs
 ---------------------------------------------------------------------------
 local EncounterTab = Window:CreateTab("⚔️ Encounters",  "swords")
 local HistoryTab   = Window:CreateTab("📜 History",     "scroll-text")
+local HuntingTab   = Window:CreateTab("🎯 Hunting",     "crosshair")
+local WebhookTab   = Window:CreateTab("🔗 Webhook",     "webhook")
 local DebugTab     = Window:CreateTab("🐛 Debug",       "bug")
 local SettingsTab  = Window:CreateTab("⚙️ Settings",    "settings")
 
@@ -282,49 +313,186 @@ local TotalEncounters = EncounterTab:CreateLabel("Total Encounters: 0", "hash", 
 local ShinyCount      = EncounterTab:CreateLabel("Shinies Found: 0", "sparkles", Color3.fromRGB(255, 215, 0), false)
 
 ---------------------------------------------------------------------------
+-- HP Update: parse -damage/-heal/faint for p2 from update data
+---------------------------------------------------------------------------
+local function parseHPUpdate(updateData)
+    if type(updateData) ~= "table" then return nil, false end
+    local newHP = nil
+    local battleEnded = false
+    for _, line in ipairs(updateData) do
+        if type(line) ~= "string" then continue end
+        -- Check for battle end
+        if line:find("|win|") or line:find("|tie") then
+            battleEnded = true
+        end
+        -- Check for damage/heal on p2: |-damage|1p2a: Name|HP/MaxHP or |faint|1p2a: Name
+        if line:find("p2") then
+            if line:find("faint") and line:find("p2") then
+                newHP = "0 (FAINTED)"
+                battleEnded = true
+            end
+            local dmgHP = line:match("%-damage|%d*p2[a-z]*:[^|]+|([^|]+)")
+            if dmgHP then
+                local h1, h2 = dmgHP:match("^(%d+)/(%d+)")
+                if h1 then newHP = h1 .. "/" .. h2 end
+                if dmgHP:find("fnt") then newHP = "0 (FAINTED)"; battleEnded = true end
+            end
+            local healHP = line:match("%-heal|%d*p2[a-z]*:[^|]+|([^|]+)")
+            if healHP then
+                local h1, h2 = healHP:match("^(%d+)/(%d+)")
+                if h1 then newHP = h1 .. "/" .. h2 end
+            end
+        end
+    end
+    return newHP, battleEnded
+end
+
+---------------------------------------------------------------------------
+-- Webhook sender
+---------------------------------------------------------------------------
+local function sendWebhook(data)
+    if webhookUrl == "" then return end
+    local color = data.IsShiny and 16766720 or 5814783 -- gold or blue
+    local payload = HttpService:JSONEncode({
+        embeds = {{
+            title = data.IsShiny and "✨ SHINY " .. data.Name .. " ✨" or "Wild " .. data.Name,
+            color = color,
+            fields = {
+                {name = "Name", value = data.Name, inline = true},
+                {name = "Level", value = "Lv. " .. data.Level, inline = true},
+                {name = "HP", value = data.HP, inline = true},
+                {name = "Shiny", value = data.Shiny, inline = true},
+            },
+            footer = {text = "PBB Roria Conquest Hub | Encounter #" .. totalEncounters}
+        }}
+    })
+    local ok, err = pcall(function()
+        if request then
+            request({Url = webhookUrl, Method = "POST", Headers = {["Content-Type"] = "application/json"}, Body = payload})
+        elseif http_request then
+            http_request({Url = webhookUrl, Method = "POST", Headers = {["Content-Type"] = "application/json"}, Body = payload})
+        elseif syn and syn.request then
+            syn.request({Url = webhookUrl, Method = "POST", Headers = {["Content-Type"] = "application/json"}, Body = payload})
+        end
+    end)
+    if not ok then print("[PBB Hub] Webhook error: " .. tostring(err)) end
+end
+
+---------------------------------------------------------------------------
+-- Auto-catch/flee decision
+---------------------------------------------------------------------------
+local function shouldCatch(data)
+    if autoCatchShiny and data.IsShiny then return true end
+    if autoCatchByName and #targetNames > 0 then
+        for _, n in ipairs(targetNames) do
+            if data.Name:lower() == n:lower() then return true end
+        end
+    end
+    if autoCatchByLevel then
+        local lv = tonumber(data.Level) or 0
+        if lv >= targetMinLevel and lv <= targetMaxLevel then return true end
+    end
+    return false
+end
+
+local function doAutoAction(catch)
+    if not gameRemote or not currentBattleId or not currentRqId then return end
+    local cmd = catch and catchCommand or fleeCommand
+    local side = currentPlayerSide or "p1"
+    pcall(function()
+        gameRemote:FireServer("BattleEvent", currentBattleId, "choose", side, currentRqId, cmd)
+    end)
+    print("[PBB Hub] Auto-" .. (catch and "catch" or "flee") .. ": sent '" .. cmd .. "'")
+end
+
+---------------------------------------------------------------------------
+-- Battle end: reset display
+---------------------------------------------------------------------------
+local function onBattleEnd()
+    inBattle = false
+    currentBattleId = nil
+    currentRqId = nil
+    currentOpponentName = nil
+    EncounterStatus:Set({ Title = "Encounter Status", Content = "⚪ Battle ended. Waiting for next encounter..." })
+    PokemonName:Set({ Title = "Pokemon Name", Content = "—" })
+    PokemonLevel:Set({ Title = "Level", Content = "—" })
+    PokemonHP:Set({ Title = "Health", Content = "—" })
+    PokemonShiny:Set({ Title = "✨ Shiny?", Content = "—" })
+    print("[PBB Hub] Battle ended, display reset")
+end
+
+---------------------------------------------------------------------------
 -- ENCOUNTER: called from the debug spy when any remote fires
 ---------------------------------------------------------------------------
 local function processEncounter(remoteName, rawArgs)
     if not encounterEnabled then return end
-    
-    -- The event type is in arg[1], NOT the remote name (remote is a hash)
+
     local eventType = rawArgs[1]
     if type(eventType) ~= "string" then return end
-    if eventType ~= "BattleEvent" then return end
-    
-    -- arg[2] = battle session ID
-    -- arg[3] = sub-command: "update", "request", "inactiveside"
-    local battleId   = rawArgs[2]
-    local subCommand = rawArgs[3]
-    
-    -- We only care about "update" commands — they contain the initial battle state
-    -- with cache entries showing the opponent's Pokemon
-    if type(subCommand) ~= "string" or subCommand ~= "update" then return end
-    
-    -- arg[4] = table of pipe-delimited Showdown protocol strings
+
+    -- Capture reference to the hashed remote for auto-catch/flee
+    if not gameRemote then
+        for _, desc in ipairs(ReplicatedStorage:GetDescendants()) do
+            if desc:IsA("RemoteEvent") and desc.Name == remoteName then
+                gameRemote = desc
+                break
+            end
+        end
+    end
+
+    -- Handle request events (capture rqid for auto-catch/flee)
+    if eventType == "BattleEvent" and rawArgs[3] == "request" then
+        currentPlayerSide = rawArgs[4]
+        currentRqId = rawArgs[5]
+        -- Auto-catch/flee triggers on request (game is waiting for player input)
+        if inBattle and (autoFleeEnabled or autoCatchShiny or autoCatchByName or autoCatchByLevel) then
+            task.delay(0.3, function()
+                local catch = shouldCatch({
+                    Name = currentOpponentName or "",
+                    Level = tostring(currentOpponentMaxHP or "?"),
+                    IsShiny = false -- we stored this at encounter start
+                })
+                doAutoAction(catch)
+            end)
+        end
+        return
+    end
+
+    if eventType ~= "BattleEvent" or rawArgs[3] ~= "update" then return end
+
+    local battleId = rawArgs[2]
     local updateData = rawArgs[4]
-    
-    -- Avoid duplicate encounters for the same battle session
-    if battleId == lastBattleSessionId then return end
-    
-    -- Try to parse opponent (p2) from the update data
+
+    -- SAME battle: just update HP
+    if battleId == lastBattleSessionId and inBattle then
+        local newHP, ended = parseHPUpdate(updateData)
+        if newHP then
+            PokemonHP:Set({ Title = "Health", Content = newHP })
+        end
+        if ended then
+            onBattleEnd()
+        end
+        return
+    end
+
+    -- NEW battle: parse opponent
     local data = parseUpdateForOpponent(updateData)
     if not data then
         EncounterStatus:Set({
             Title   = "Encounter Status",
             Content = "🟡 BattleEvent update received but couldn't find opponent (p2) data.\nCheck Debug tab for raw args."
         })
-        print("[PBB Hub] BattleEvent update received but no p2 data found")
         return
     end
-    
-    -- Mark this session as processed
+
     lastBattleSessionId = battleId
-    
+    currentBattleId = battleId
+    inBattle = true
+    currentOpponentName = data.Name
+    currentOpponentMaxHP = data.Level
+
     totalEncounters += 1
-    if data.IsShiny then
-        totalShinies += 1
-    end
+    if data.IsShiny then totalShinies += 1 end
 
     -- Update live UI
     EncounterStatus:Set({ Title = "Encounter Status", Content = "🟢 BATTLE DETECTED!" })
@@ -336,41 +504,38 @@ local function processEncounter(remoteName, rawArgs)
     TotalEncounters:Set("Total Encounters: " .. totalEncounters, "hash", Color3.fromRGB(255, 255, 255), false)
     ShinyCount:Set("Shinies Found: " .. totalShinies, "sparkles", Color3.fromRGB(255, 215, 0), false)
 
-    -- Add to encounter history
+    -- History
     local timestamp = os.date("%H:%M:%S")
     local entry = string.format("[%s] %s | Lv.%s | HP: %s | Shiny: %s",
         timestamp, data.Name, data.Level, data.HP, data.Shiny)
-
     table.insert(encounterLog, 1, entry)
-    if #encounterLog > MAX_LOG_ENTRIES then
-        table.remove(encounterLog)
-    end
-
+    if #encounterLog > MAX_LOG_ENTRIES then table.remove(encounterLog) end
     HistoryParagraph:Set({
         Title   = "Encounter History (" .. #encounterLog .. ")",
         Content = table.concat(encounterLog, "\n")
     })
 
-    -- Shiny notification
+    -- Notification
     if data.IsShiny then
-        Rayfield:Notify({
-            Title    = "✨ SHINY FOUND! ✨",
-            Content  = data.Name .. " (Lv." .. data.Level .. ") is SHINY!",
-            Duration = 10,
-            Image    = "sparkles"
-        })
+        Rayfield:Notify({ Title = "✨ SHINY FOUND! ✨", Content = data.Name .. " (Lv." .. data.Level .. ") is SHINY!", Duration = 10, Image = "sparkles" })
     else
-        Rayfield:Notify({
-            Title    = "Wild Pokemon!",
-            Content  = data.Name .. " (Lv." .. data.Level .. ")",
-            Duration = 4,
-            Image    = "swords"
-        })
+        Rayfield:Notify({ Title = "Wild Pokemon!", Content = data.Name .. " (Lv." .. data.Level .. ")", Duration = 4, Image = "swords" })
     end
 
-    -- Console log
+    -- Webhook
+    if (webhookOnAll) or (webhookOnShiny and data.IsShiny) then
+        sendWebhook(data)
+    end
+
+    -- Console
     print(string.format("[PBB Hub] Encounter #%d: %s | Lv.%s | HP: %s | Shiny: %s",
         totalEncounters, data.Name, data.Level, data.HP, data.Shiny))
+
+    -- Store shiny status for auto-catch decision
+    -- We need this stored because the request event comes after the update
+    getgenv().__pbb_lastShiny = data.IsShiny
+    getgenv().__pbb_lastLevel = data.Level
+    getgenv().__pbb_lastName = data.Name
 end
 
 ---------------------------------------------------------------------------
@@ -396,6 +561,199 @@ HistoryTab:CreateButton({
             Duration = 3,
             Image    = "trash-2"
         })
+    end
+})
+
+---------------------------------------------------------------------------
+--                        HUNTING TAB
+---------------------------------------------------------------------------
+
+HuntingTab:CreateSection("Auto-Search")
+
+HuntingTab:CreateToggle({
+    Name         = "🚶 Enable Auto-Search (Walk to encounter)",
+    CurrentValue = false,
+    Flag         = "AutoSearchToggle",
+    Callback     = function(value)
+        autoSearchEnabled = value
+        if value then
+            -- Check if we have a character
+            local char = LocalPlayer.Character
+            if not char or not char:FindFirstChild("Humanoid") or not char:FindFirstChild("HumanoidRootPart") then
+                Rayfield:Notify({
+                    Title    = "Error",
+                    Content  = "Character not found!",
+                    Duration = 3,
+                    Image    = "alert-circle"
+                })
+                autoSearchEnabled = false
+                return
+            end
+            
+            -- Start loop if not already running
+            if not getgenv().autoSearchRunning then
+                getgenv().autoSearchRunning = true
+                task.spawn(function()
+                    local originPos = nil
+                    local moveTarget = 1 -- 1 or -1 for direction
+                    while task.wait(0.5) do
+                        if not autoSearchEnabled then
+                            getgenv().autoSearchRunning = false
+                            break
+                        end
+                        
+                        -- Pause walking if in battle
+                        if inBattle then
+                            task.wait(1)
+                            continue
+                        end
+                        
+                        local char = LocalPlayer.Character
+                        if char and char:FindFirstChild("Humanoid") and char:FindFirstChild("HumanoidRootPart") then
+                            local hrp = char.HumanoidRootPart
+                            local hum = char.Humanoid
+                            
+                            if not originPos then
+                                originPos = hrp.Position
+                            end
+                            
+                            -- Check distance from origin to decide when to turn around
+                            local dist = (hrp.Position - originPos).Magnitude
+                            if dist >= searchDistance then
+                                moveTarget = moveTarget * -1 -- Flip direction
+                                originPos = hrp.Position -- Reset origin to current pos to walk back
+                            end
+                            
+                            -- Move (walk along LookVector)
+                            local moveDir = hrp.CFrame.LookVector * (moveTarget * searchDistance)
+                            hum:MoveTo(hrp.Position + moveDir)
+                        end
+                    end
+                end)
+            end
+        else
+            -- Stop moving if we disable it
+            local char = LocalPlayer.Character
+            if char and char:FindFirstChild("Humanoid") then
+                char.Humanoid:MoveTo(char.HumanoidRootPart.Position)
+            end
+        end
+    end
+})
+
+HuntingTab:CreateSlider({
+    Name = "Walk Distance",
+    Range = {5, 50},
+    Increment = 1,
+    Suffix = "Studs",
+    CurrentValue = 20,
+    Flag = "SearchDistanceSlider",
+    Callback = function(Value)
+        searchDistance = Value
+    end,
+})
+
+HuntingTab:CreateSection("Auto-Catch & Auto-Flee")
+HuntingTab:CreateParagraph({
+    Title = "Protocol Warning",
+    Content = "Uses default Showdown commands ('run', 'ball 1'). If these don't work, manually flee/catch with Debug Spy ON and check the [OUT] log to find the correct command."
+})
+
+HuntingTab:CreateToggle({
+    Name = "🏃 Auto-Flee (If no catch conditions met)",
+    CurrentValue = false,
+    Flag = "AutoFleeToggle",
+    Callback = function(val) autoFleeEnabled = val end
+})
+
+HuntingTab:CreateToggle({
+    Name = "✨ Auto-Catch Shiny",
+    CurrentValue = false,
+    Flag = "AutoCatchShinyToggle",
+    Callback = function(val) autoCatchShiny = val end
+})
+
+HuntingTab:CreateToggle({
+    Name = "🎯 Auto-Catch by Name",
+    CurrentValue = false,
+    Flag = "AutoCatchNameToggle",
+    Callback = function(val) autoCatchByName = val end
+})
+
+HuntingTab:CreateInput({
+    Name = "Target Names (comma separated)",
+    PlaceholderText = "Pikachu, Eevee, Mew",
+    RemoveTextAfterFocusLost = false,
+    Callback = function(Text)
+        targetNames = {}
+        for name in Text:gmatch("[^,]+") do
+            name = name:match("^%s*(.-)%s*$") -- trim
+            if name and #name > 0 then
+                table.insert(targetNames, name)
+            end
+        end
+    end,
+})
+
+HuntingTab:CreateToggle({
+    Name = "📊 Auto-Catch by Level",
+    CurrentValue = false,
+    Flag = "AutoCatchLevelToggle",
+    Callback = function(val) autoCatchByLevel = val end
+})
+
+HuntingTab:CreateSlider({
+    Name = "Min Level",
+    Range = {1, 100},
+    Increment = 1,
+    Suffix = "Lv",
+    CurrentValue = 1,
+    Flag = "MinLevelSlider",
+    Callback = function(Value) targetMinLevel = Value end,
+})
+
+HuntingTab:CreateSlider({
+    Name = "Max Level",
+    Range = {1, 100},
+    Increment = 1,
+    Suffix = "Lv",
+    CurrentValue = 100,
+    Flag = "MaxLevelSlider",
+    Callback = function(Value) targetMaxLevel = Value end,
+})
+
+---------------------------------------------------------------------------
+--                        WEBHOOK TAB
+---------------------------------------------------------------------------
+WebhookTab:CreateInput({
+    Name = "Discord Webhook URL",
+    PlaceholderText = "https://discord.com/api/webhooks/...",
+    RemoveTextAfterFocusLost = false,
+    Callback = function(Text) webhookUrl = Text end,
+})
+
+WebhookTab:CreateToggle({
+    Name = "Send on Shiny Encounter",
+    CurrentValue = true,
+    Flag = "WebhookShinyToggle",
+    Callback = function(val) webhookOnShiny = val end
+})
+
+WebhookTab:CreateToggle({
+    Name = "Send on ALL Encounters",
+    CurrentValue = false,
+    Flag = "WebhookAllToggle",
+    Callback = function(val) webhookOnAll = val end
+})
+
+WebhookTab:CreateButton({
+    Name = "Test Webhook",
+    Callback = function()
+        if webhookUrl == "" then
+            Rayfield:Notify({Title="Error", Content="Enter a Webhook URL first!", Duration=3, Image="x"})
+            return
+        end
+        sendWebhook({Name="Testachu", Level="99", HP="100/100", IsShiny=true, Shiny="✨ YES — SHINY!"})
     end
 })
 
@@ -605,9 +963,24 @@ SettingsTab:CreateToggle({
 
 SettingsTab:CreateDivider()
 
+SettingsTab:CreateDivider()
+
+SettingsTab:CreateButton({
+    Name = "🔄 Reset Encounter Counter",
+    Callback = function()
+        totalEncounters = 0
+        totalShinies = 0
+        TotalEncounters:Set("Total Encounters: 0", "hash", Color3.fromRGB(255, 255, 255), false)
+        ShinyCount:Set("Shinies Found: 0", "sparkles", Color3.fromRGB(255, 215, 0), false)
+        Rayfield:Notify({Title="Reset", Content="Counters reset to 0.", Duration=2, Image="rotate-ccw"})
+    end
+})
+
+SettingsTab:CreateDivider()
+
 SettingsTab:CreateParagraph({
     Title   = "ℹ️  How to use",
-    Content = "1. Enable Debug Remote Spy in Settings (captures all remotes)\n2. Enable Encounter Tracker in Settings\n3. Start a wild battle in-game\n4. The spy detects battle remotes and feeds data to Encounters tab\n5. History tab keeps a log of past encounters\n6. Use Debug tab to see raw remote traffic, copy logs, or hide them"
+    Content = "1. Enable Debug Remote Spy in Settings (captures all remotes)\n2. Enable Encounter Tracker in Settings\n3. Start a wild battle in-game\n4. The spy detects battle remotes and feeds data to Encounters tab\n5. Use Hunting tab to auto-walk and auto-catch/flee."
 })
 
 ---------------------------------------------------------------------------
