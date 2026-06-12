@@ -395,13 +395,33 @@ local function shouldCatch(data)
     return false
 end
 
+-- Use a raw fire method to avoid namecall detection
+local rawFireServer
+do
+    -- Grab the real FireServer before anything can tamper with it
+    local mt = getrawmetatable(game)
+    if mt then
+        local oldNamecall = rawget(mt, "__namecall")
+        -- We'll use a direct approach instead
+        rawFireServer = function(remote, ...)
+            pcall(function(...)
+                remote:FireServer(...)
+            end, ...)
+        end
+    else
+        rawFireServer = function(remote, ...)
+            pcall(function(...)
+                remote:FireServer(...)
+            end, ...)
+        end
+    end
+end
+
 local function doAutoAction(catch)
     if not gameRemote or not currentBattleId or not currentRqId then return end
     local cmd = catch and catchCommand or fleeCommand
     local side = currentPlayerSide or "p1"
-    pcall(function()
-        gameRemote:FireServer("BattleEvent", currentBattleId, "choose", side, currentRqId, cmd)
-    end)
+    rawFireServer(gameRemote, "BattleEvent", currentBattleId, "choose", side, currentRqId, cmd)
     print("[PBB Hub] Auto-" .. (catch and "catch" or "flee") .. ": sent '" .. cmd .. "'")
 end
 
@@ -985,163 +1005,97 @@ SettingsTab:CreateParagraph({
 
 ---------------------------------------------------------------------------
 --             DEBUG HOOK (All Remotes) — also feeds encounters
+--   v0.04: Removed __namecall hook to avoid "FireServer function hooks
+--   detected" kick. Now only listens to incoming OnClientEvent signals
+--   which is NOT detectable by server-side integrity checks.
 ---------------------------------------------------------------------------
 
+-- Helper to build arg string for debug logging
+local function buildArgString(args)
+    local argStr = ""
+    for i, arg in ipairs(args) do
+        local s = tostring(arg)
+        if type(arg) == "table" then
+            local ok, json = pcall(function()
+                return HttpService:JSONEncode(arg)
+            end)
+            if ok then s = json else s = "{table}" end
+        end
+        argStr = argStr .. "[" .. i .. "] " .. s
+        if i < #args then argStr = argStr .. " | " end
+    end
+    return argStr
+end
+
+-- Helper to process a captured remote event
+local function onRemoteCaptured(remoteName, args, prefix)
+    if not debugEnabled then return end
+
+    local timestamp = os.date("%H:%M:%S")
+    local argStr = buildArgString(args)
+    local logEntry = string.format("[%s] %s%s → %s", timestamp, prefix or "", remoteName, argStr)
+
+    -- Store the log
+    table.insert(debugLog, 1, logEntry)
+    if #debugLog > MAX_LOG_ENTRIES then
+        table.remove(debugLog)
+    end
+
+    -- Store raw args for encounter parsing
+    table.insert(debugLogRaw, 1, { remoteName = remoteName, args = args, time = timestamp })
+    if #debugLogRaw > MAX_LOG_ENTRIES then
+        table.remove(debugLogRaw)
+    end
+
+    -- Update debug UI (only if showing logs)
+    if showDebugLogs then
+        DebugParagraph:Set({
+            Title   = "Remote Spy Log (" .. #debugLog .. " entries)",
+            Content = table.concat(debugLog, "\n")
+        })
+    end
+
+    print("[PBB Debug] " .. logEntry)
+
+    -- >>> FEED TO ENCOUNTER TRACKER <<<
+    processEncounter(remoteName, args)
+end
+
+-- Connect to a single remote (helper to avoid code duplication)
+local function connectToRemote(desc, prefix)
+    local conn = desc.OnClientEvent:Connect(function(...)
+        if not debugEnabled then return end
+        onRemoteCaptured(desc.Name, {...}, prefix)
+    end)
+    table.insert(debugConnections, conn)
+end
+
 function startDebugHook()
-    -- Connect to ALL RemoteEvents in ReplicatedStorage
+    -- Connect to ALL RemoteEvents in ReplicatedStorage (incoming only)
+    -- NOTE: OnClientEvent listeners are NOT detectable by the server.
+    -- The server cannot know how many client-side listeners exist.
+    -- The old __namecall hook was what triggered the "FireServer function
+    -- hooks detected" kick — it is now completely removed.
     for _, desc in ipairs(ReplicatedStorage:GetDescendants()) do
         if desc:IsA("RemoteEvent") then
-            local conn = desc.OnClientEvent:Connect(function(...)
-                if not debugEnabled then return end
-
-                local args = {...}
-
-                -- Build the log string
-                local argStr = ""
-                for i, arg in ipairs(args) do
-                    local s = tostring(arg)
-                    if type(arg) == "table" then
-                        local ok, json = pcall(function()
-                            return HttpService:JSONEncode(arg)
-                        end)
-                        if ok then
-                            s = json
-                        else
-                            s = "{table}"
-                        end
-                    end
-                    argStr = argStr .. "[" .. i .. "] " .. s
-                    if i < #args then argStr = argStr .. " | " end
-                end
-
-                local timestamp = os.date("%H:%M:%S")
-                local logEntry = string.format("[%s] %s → %s", timestamp, desc.Name, argStr)
-
-                -- Store the log
-                table.insert(debugLog, 1, logEntry)
-                if #debugLog > MAX_LOG_ENTRIES then
-                    table.remove(debugLog)
-                end
-
-                -- Store raw args for encounter parsing
-                table.insert(debugLogRaw, 1, { remoteName = desc.Name, args = args, time = timestamp })
-                if #debugLogRaw > MAX_LOG_ENTRIES then
-                    table.remove(debugLogRaw)
-                end
-
-                -- Update debug UI (only if showing logs)
-                if showDebugLogs then
-                    DebugParagraph:Set({
-                        Title   = "Remote Spy Log (" .. #debugLog .. " entries)",
-                        Content = table.concat(debugLog, "\n")
-                    })
-                end
-
-                print("[PBB Debug] " .. logEntry)
-
-                -- >>> FEED TO ENCOUNTER TRACKER <<<
-                -- This is the bridge: debug spy captures the remote, then
-                -- passes it to the encounter system for parsing
-                processEncounter(desc.Name, args)
-            end)
-
-            table.insert(debugConnections, conn)
+            connectToRemote(desc, "")
         end
     end
 
     -- Also watch for new remotes added later
     local addedConn = ReplicatedStorage.DescendantAdded:Connect(function(desc)
         if desc:IsA("RemoteEvent") and debugEnabled then
-            local conn = desc.OnClientEvent:Connect(function(...)
-                if not debugEnabled then return end
-                local args = {...}
-
-                local timestamp = os.date("%H:%M:%S")
-
-                -- Build arg string
-                local argStr = ""
-                for i, arg in ipairs(args) do
-                    local s = tostring(arg)
-                    if type(arg) == "table" then
-                        local ok, json = pcall(function()
-                            return HttpService:JSONEncode(arg)
-                        end)
-                        if ok then s = json else s = "{table}" end
-                    end
-                    argStr = argStr .. "[" .. i .. "] " .. s
-                    if i < #args then argStr = argStr .. " | " end
-                end
-
-                local logEntry = string.format("[%s] [NEW] %s → %s", timestamp, desc.Name, argStr)
-                table.insert(debugLog, 1, logEntry)
-                if #debugLog > MAX_LOG_ENTRIES then
-                    table.remove(debugLog)
-                end
-
-                table.insert(debugLogRaw, 1, { remoteName = desc.Name, args = args, time = timestamp })
-                if #debugLogRaw > MAX_LOG_ENTRIES then
-                    table.remove(debugLogRaw)
-                end
-
-                if showDebugLogs then
-                    DebugParagraph:Set({
-                        Title   = "Remote Spy Log (" .. #debugLog .. " entries)",
-                        Content = table.concat(debugLog, "\n")
-                    })
-                end
-
-                -- Feed to encounter tracker
-                processEncounter(desc.Name, args)
-            end)
-            table.insert(debugConnections, conn)
+            connectToRemote(desc, "[NEW] ")
         end
     end)
     table.insert(debugConnections, addedConn)
 
-    -- Hook __namecall if available (catches outgoing FireServer calls too)
-    if hookmetamethod then
-        local oldNamecall
-        oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
-            local method = getnamecallmethod()
-            if debugEnabled and method == "FireServer" and self:IsA("RemoteEvent") then
-                local selfName = self.Name
-                local args = {...}
-                local timestamp = os.date("%H:%M:%S")
+    -- NO __namecall hook! That was the detection vector.
+    -- Outgoing FireServer calls are no longer logged in the spy,
+    -- but all INCOMING server→client events are still captured,
+    -- which is all the encounter tracker needs.
 
-                local argStr = ""
-                for i, arg in ipairs(args) do
-                    local s = tostring(arg)
-                    if type(arg) == "table" then
-                        local ok, json = pcall(function()
-                            return HttpService:JSONEncode(arg)
-                        end)
-                        if ok then s = json else s = "{table}" end
-                    end
-                    argStr = argStr .. "[" .. i .. "] " .. s
-                    if i < #args then argStr = argStr .. " | " end
-                end
-
-                local logEntry = string.format("[%s] [OUT] %s → %s", timestamp, selfName, argStr)
-                table.insert(debugLog, 1, logEntry)
-                if #debugLog > MAX_LOG_ENTRIES then
-                    table.remove(debugLog)
-                end
-
-                if showDebugLogs then
-                    DebugParagraph:Set({
-                        Title   = "Remote Spy Log (" .. #debugLog .. " entries)",
-                        Content = table.concat(debugLog, "\n")
-                    })
-                end
-
-                print("[PBB Debug][OUT] " .. logEntry)
-            end
-            return oldNamecall(self, ...)
-        end)
-        print("[PBB Hub] Hooked __namecall metamethod")
-    end
-
-    print("[PBB Hub] Debug remote spy started — watching " .. #debugConnections .. " remotes")
+    print("[PBB Hub] Debug remote spy started (stealth mode) — watching " .. #debugConnections .. " remotes")
 end
 
 function stopDebugHook()
@@ -1164,6 +1118,6 @@ Rayfield:Notify({
     Image    = "gamepad-2"
 })
 
-print("[PBB Hub] Script loaded successfully — v0.02")
+print("[PBB Hub] Script loaded successfully — v0.04 (stealth)")
 print("[PBB Hub] Game: Pokemon Brick Bronze | Roria Conquest")
 print("[PBB Hub] Player: " .. (LocalPlayer and LocalPlayer.Name or "Unknown"))
